@@ -63,6 +63,7 @@ import org.springframework.util.Assert;
  * @author Su Ko
  * @author Ngoc Nhan
  * @author Jian Kim
+ * @author Jiyeon Kim
  */
 public class ConcurrentMessageListenerContainer<K, V> extends AbstractMessageListenerContainer<K, V> {
 
@@ -483,10 +484,9 @@ public class ConcurrentMessageListenerContainer<K, V> extends AbstractMessageLis
 	public void pausePartition(TopicPartition topicPartition) {
 		this.lifecycleLock.lock();
 		try {
-			this.containers
-					.stream()
-					.filter(container -> containsPartition(topicPartition, container))
-					.forEach(container -> container.pausePartition(topicPartition));
+			// Request the pause on every child; a rebalance can move the partition to
+			// another child, which then pauses it when it is assigned
+			this.containers.forEach(container -> container.pausePartition(topicPartition));
 		}
 		finally {
 			this.lifecycleLock.unlock();
@@ -551,11 +551,6 @@ public class ConcurrentMessageListenerContainer<K, V> extends AbstractMessageLis
 		finally {
 			this.lifecycleLock.unlock();
 		}
-	}
-
-	private boolean containsPartition(TopicPartition topicPartition, KafkaMessageListenerContainer<K, V> container) {
-		Collection<TopicPartition> assignedPartitions = container.getAssignedPartitions();
-		return assignedPartitions != null && assignedPartitions.contains(topicPartition);
 	}
 
 	private void clearState() {

@@ -96,6 +96,7 @@ import static org.mockito.Mockito.verify;
  * @author Nikita Kibitkin
  * @author Hyun Lee
  * @author Jian Kim
+ * @author Jiyeon Kim
  *
  * @since 2.2.4
  *
@@ -1017,6 +1018,8 @@ public class ConcurrentMessageListenerContainerMockTests {
 			assertThat(container.isPartitionPauseRequested(tp1)).isTrue();
 			assertThat(container.isPartitionPauseRequested(tp0)).isFalse();
 			container.pausePartition(unassigned);
+			assertThat(container.isPartitionPauseRequested(unassigned)).isTrue();
+			container.resumePartition(unassigned);
 			assertThat(container.isPartitionPauseRequested(unassigned)).isFalse();
 			container.pausePartition(tp0);
 			assertThat(container.isPartitionPauseRequested(tp0)).isTrue();
@@ -1088,6 +1091,74 @@ public class ConcurrentMessageListenerContainerMockTests {
 		rebal.get().onPartitionsAssigned(assignments);
 		verify(consumer, times(2)).pause(any()); // no immediate pause this time
 		container.stop();
+	}
+
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	@Test
+	void partitionPauseFollowsPartitionToAnotherChild() throws InterruptedException {
+		Consumer consumer0 = mock(Consumer.class);
+		Consumer consumer1 = mock(Consumer.class);
+		CountDownLatch pollLatch = new CountDownLatch(2);
+		CountDownLatch pause0Latch = new CountDownLatch(1);
+		TopicPartition tp0 = new TopicPartition("foo", 0);
+		TopicPartition tp1 = new TopicPartition("foo", 1);
+		Map<Consumer, AtomicReference<ConsumerRebalanceListener>> rebal = new HashMap<>();
+		Map<Consumer, List<TopicPartition>> initial = Map.of(consumer0, List.of(tp0), consumer1, List.of(tp1));
+		for (Consumer consumer : List.of(consumer0, consumer1)) {
+			AtomicReference<ConsumerRebalanceListener> ref = new AtomicReference<>();
+			rebal.put(consumer, ref);
+			willAnswer(inv -> {
+				pollLatch.countDown();
+				Thread.sleep(50);
+				return ConsumerRecords.empty();
+			}).given(consumer).poll(any());
+			willAnswer(invocation -> {
+				ref.set(invocation.getArgument(1));
+				ref.get().onPartitionsAssigned(initial.get(consumer));
+				return null;
+			}).given(consumer).subscribe(any(Collection.class), any());
+		}
+		willAnswer(inv -> {
+			pause0Latch.countDown();
+			return null;
+		}).given(consumer0).pause(any());
+		CountDownLatch pause1Latch = new CountDownLatch(1);
+		willAnswer(inv -> {
+			if (inv.getArgument(0, Collection.class).contains(tp0)) {
+				pause1Latch.countDown();
+			}
+			return null;
+		}).given(consumer1).pause(any());
+		ConsumerFactory cf = mock(ConsumerFactory.class);
+		given(cf.createConsumer(any(), any(), any(), any())).willReturn(consumer0, consumer1);
+		given(cf.getConfigurationProperties())
+				.willReturn(Collections.singletonMap(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest"));
+		ContainerProperties containerProperties = new ContainerProperties("foo");
+		containerProperties.setGroupId("grp");
+		containerProperties.setMessageListener((MessageListener) rec -> { });
+		containerProperties.setMissingTopicsFatal(false);
+		containerProperties.setAssignmentCommitOption(AssignmentCommitOption.LATEST_ONLY);
+		ConcurrentMessageListenerContainer container = new ConcurrentMessageListenerContainer(cf,
+				containerProperties);
+		container.setConcurrency(2);
+		container.start();
+		try {
+			assertThat(pollLatch.await(10, TimeUnit.SECONDS)).isTrue();
+			container.pausePartition(tp0);
+			assertThat(pause0Latch.await(10, TimeUnit.SECONDS)).isTrue();
+			// rebalance moves tp0 from child 0 to child 1
+			rebal.get(consumer0).get().onPartitionsRevoked(List.of(tp0));
+			rebal.get(consumer0).get().onPartitionsAssigned(List.of());
+			rebal.get(consumer1).get().onPartitionsRevoked(List.of(tp1));
+			rebal.get(consumer1).get().onPartitionsAssigned(List.of(tp0, tp1));
+			assertThat(container.isPartitionPauseRequested(tp0)).isTrue();
+			assertThat(((MessageListenerContainer) container.getContainers().get(1))
+					.isPartitionPauseRequested(tp0)).isTrue();
+			assertThat(pause1Latch.await(10, TimeUnit.SECONDS)).isTrue();
+		}
+		finally {
+			container.stop();
+		}
 	}
 
 	@SuppressWarnings({ "unchecked", "rawtypes" })
